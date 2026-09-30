@@ -12,6 +12,7 @@ import { ClaudeProvider } from './providers/claude-provider';
 import { CodexProvider } from './providers/codex-provider';
 import type { ProviderHandlers, SessionStartPayload, SessionEventsPayload } from './providers/types';
 import type { ParsedEvent } from './parsers/session-parser';
+import { buildAllowedOrigins, isOriginAllowed, resolveBindHostname } from './origin-guard';
 
 /** Return IPv4 addresses bound to non-internal, non-link-local interfaces. */
 function listLanAddresses(): string[] {
@@ -32,6 +33,14 @@ function listLanAddresses(): string[] {
 const PORT = Number(process.env.PORT) || 4444;
 const CLIENT_URL = process.env.CLIENT_URL ?? 'http://localhost:4445';
 const LAN_ENABLED = /^(1|true|yes|on)$/i.test(process.env.AGENT_QUEST_LAN ?? '');
+const CLIENT_PORT = Number(process.env.CLIENT_PORT) || 4445;
+const BIND_HOSTNAME = resolveBindHostname(LAN_ENABLED);
+const ALLOWED_ORIGINS = buildAllowedOrigins({
+  clientUrl: CLIENT_URL,
+  clientPort: CLIENT_PORT,
+  lanEnabled: LAN_ENABLED,
+  lanAddresses: LAN_ENABLED ? listLanAddresses() : [],
+});
 const IDLE_THRESHOLD_MS = 5 * 60_000;       // 5 minutes without events → idle
 const COMPLETED_THRESHOLD_MS = 30 * 60_000; // 30 minutes idle → completed
 const STALE_THRESHOLD_MS = 2 * 60 * 60_000; // 2 hours completed → remove (keep min 5)
@@ -59,17 +68,26 @@ const wsServer = new WebSocketServer();
 const mapStorage = new MapStorage();
 
 // --- CORS for client on :4445 ---
-// In LAN mode we reflect any origin (the client is served from the host's
-// LAN IP which we can't know in advance). Otherwise we stick to the
-// configured CLIENT_URL for a tight localhost-only default.
+// Only the dashboard's own origins (loopback, plus this host's LAN IPs in LAN
+// mode) are reflected. Everything else gets no CORS headers.
 console.log('[Server] CORS config', {
   LAN_ENABLED,
   AGENT_QUEST_LAN_env: process.env.AGENT_QUEST_LAN ?? '(unset)',
-  CLIENT_URL,
+  allowedOrigins: [...ALLOWED_ORIGINS],
 });
 app.use('*', cors({
-  origin: LAN_ENABLED ? (origin) => origin ?? CLIENT_URL : CLIENT_URL,
+  origin: (origin) => (origin !== '' && isOriginAllowed(origin, ALLOWED_ORIGINS) ? origin : null),
 }));
+
+// CORS does not stop a cross-site "simple" POST from being sent, so reject
+// state-changing requests from foreign pages before they reach a handler.
+app.use('*', async (c, next) => {
+  if (c.req.method !== 'GET' && c.req.method !== 'HEAD' && c.req.method !== 'OPTIONS'
+      && !isOriginAllowed(c.req.header('origin'), ALLOWED_ORIGINS)) {
+    return c.json({ ok: false, error: 'origin not allowed' }, 403);
+  }
+  await next();
+});
 
 // --- HTTP endpoints ---
 app.get('/api/health', (c) => c.json({ status: 'ok', agents: stateManager.getAll().length, clients: wsServer.clientCount }));
@@ -232,10 +250,15 @@ setInterval(() => {
 
 // --- Start ---
 const server = Bun.serve({
+  hostname: BIND_HOSTNAME,
   port: PORT,
   fetch(req, server) {
-    // WebSocket upgrade
+    // WebSocket upgrade — not covered by CORS, so the Origin check is the only
+    // thing stopping any open browser tab from reading the live feed.
     if (new URL(req.url).pathname === '/ws') {
+      if (!isOriginAllowed(req.headers.get('origin'), ALLOWED_ORIGINS)) {
+        return new Response('Origin not allowed', { status: 403 });
+      }
       const id = crypto.randomUUID();
       const upgraded = server.upgrade(req, { data: { id } });
       if (upgraded) return undefined;
@@ -259,7 +282,7 @@ const server = Bun.serve({
   },
 });
 
-console.log(`[Server] Agent Quest server running on http://localhost:${PORT}`);
+console.log(`[Server] Agent Quest server running on http://localhost:${PORT} (bound to ${BIND_HOSTNAME})`);
 console.log(`[Server] WebSocket endpoint: ws://localhost:${PORT}/ws`);
 console.log(`[Server] Health check: http://localhost:${PORT}/api/health`);
 
